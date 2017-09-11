@@ -123,6 +123,11 @@ networkInterfaceId() {
     echo ${id}
 }
 
+describeVpcs() {
+    [[ $# -ne 0 ]] && { >&2 echo "Usage: $0 $FUNCNAME"; return 1; }
+    aws ec2 describe-vpcs | jq -rc '.Vpcs[] | { Id:.VpcId, Name:(.Tags[] | select( .Key=="Name" ) | .Value) }'
+}
+
 disableSourceDestinationCheck() {
     [[ $# -ne 2 ]] && { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID INSTANCE_NAME"; return 1; }
     local systemId instanceName networkInterfaceId
