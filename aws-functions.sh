@@ -128,6 +128,16 @@ describeVpcs() {
     aws ec2 describe-vpcs | jq -rc '.Vpcs[] | { Id:.VpcId, Name:(.Tags[] | select( .Key=="Name" ) | .Value) }'
 }
 
+describeInstances() {
+    [[ $# -ne 0 ]] && { >&2 echo "Usage: $0 $FUNCNAME"; return 1; }
+    aws ec2 describe-instances | jq -c '.Reservations[].Instances[] | { Id:.InstanceId, State:.State.Name, Name:(.Tags[] | select(.Key=="Name") | .Value), Vpc:.VpcId } '
+}
+
+describeSubnets() {
+    [[ $# -ne 0 ]] && { >&2 echo "Usage: $0 $FUNCNAME"; return 1; }
+    aws ec2 describe-subnets | jq -c '.Subnets[] | { Id:.SubnetId, Cidr:.CidrBlock, Name:(if .Tags != null then (.Tags[] | select(.Key=="Name") | .Value) else "N/A" end), Vpc:.VpcId }'
+}
+
 disableSourceDestinationCheck() {
     [[ $# -ne 2 ]] && { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID INSTANCE_NAME"; return 1; }
     local systemId instanceName networkInterfaceId
