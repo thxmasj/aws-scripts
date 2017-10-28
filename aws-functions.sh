@@ -72,8 +72,13 @@ nodeName() {
 vpcId() {
     [[ $# -ne 1 ]] && { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID"; return 1; }
     local systemId=$1
-    output=$(aws ec2 describe-vpcs --filters $(tagFilter SystemId ${systemId})) || return 1
-    id=$(echo ${output} | jq -er ".Vpcs[].VpcId") || return 1
+    local id
+    [[ ${systemId} == vpc-* ]] && {
+        id=${systemId}
+    } || {
+        output=$(aws ec2 describe-vpcs --filters $(tagFilter SystemId ${systemId})) || return 1
+        id=$(echo ${output} | jq -er ".Vpcs[].VpcId") || return 1
+    }
     echo "${id}"
 }
 
@@ -85,21 +90,30 @@ vpcFilter() {
 
 imageId() {
     [[ $# -ne 1 ]] && { >&2 echo "Usage: $0 $FUNCNAME NAME"; return 1; }
-    local name output
-    name=${1}
-    output=$(aws ec2 describe-images --filters Name=name,Values=${name}) || return 1
-    id=$(echo ${output} | jq -er ".Images[].ImageId") || { >&2 echo "Error extracting id from response ${output}"; return 1; }
+    local name=${1}
+    [[ ${name} == ami-* ]] && {
+        id=${name}
+    } || {
+        local output
+        output=$(aws ec2 describe-images --filters Name=name,Values=${name}) || return 1
+        id=$(echo ${output} | jq -er ".Images[].ImageId") || { >&2 echo "Error extracting id from response ${output}"; return 1; }
+    }
     echo -n ${id}
 }
 
 subnetId() {
     [[ $# -ne 2 ]] && { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID NAME"; return 1; }
-    local id output systemId name
+    local id systemId name
     systemId=${1}
     name=${2}
     vpcId=$(vpcId ${systemId})
-    output=$(aws ec2 describe-subnets --filters $(nameFilter ${name}) Name=vpc-id,Values=${vpcId})
-    id=$(echo ${output} | jq -er ".Subnets[].SubnetId") || { >&2 echo "Error extracting id from response ${output}"; return 1; }
+    [[ ${name} == subnet-* ]] && {
+        id=${name}
+    } || {
+        local output
+        output=$(aws ec2 describe-subnets --filters $(nameFilter ${name}) Name=vpc-id,Values=${vpcId})
+        id=$(echo ${output} | jq -er ".Subnets[].SubnetId") || { >&2 echo "Error extracting id from response ${output}"; return 1; }
+    }
     echo -n ${id}
 }
 
@@ -125,12 +139,18 @@ networkInterfaceId() {
 
 describeVpcs() {
     [[ $# -ne 0 ]] && { >&2 echo "Usage: $0 $FUNCNAME"; return 1; }
-    aws ec2 describe-vpcs | jq -rc '.Vpcs[] | { Id:.VpcId, Name:(.Tags[] | select( .Key=="Name" ) | .Value) }'
+    aws ec2 describe-vpcs | jq -rc '.Vpcs[] | { Id:.VpcId, Name:(if .Tags != null then (.Tags[] | select(.Key=="Name") | .Value) else "N/A" end), Cidr:.CidrBlock }'
 }
 
 describeInstances() {
     [[ $# -ne 0 ]] && { >&2 echo "Usage: $0 $FUNCNAME"; return 1; }
-    aws ec2 describe-instances | jq -c '.Reservations[].Instances[] | { Id:.InstanceId, State:.State.Name, Name:(.Tags[] | select(.Key=="Name") | .Value), Vpc:.VpcId } '
+    aws ec2 describe-instances | jq -c '.Reservations[].Instances[] | { Id:.InstanceId, State:.State.Name, Image:.ImageId, Name:(if .Tags != null then (.Tags[] | select(.Key=="Name") | .Value) else "N/A" end), Vpc:.VpcId, Subnet:.SubnetId, PublicIp:.PublicIpAddress, PrivateIp:.PrivateIpAddress } '
+}
+
+describeInstance() {
+    [[ $# -ne 1 ]] && { >&2 echo "Usage: $0 $FUNCNAME INSTANCE_ID"; return 1; }
+    local instanceId=$1
+    aws ec2 describe-instances --instance-ids ${instanceId} | jq '.'
 }
 
 describeSubnets() {
@@ -147,15 +167,40 @@ disableSourceDestinationCheck() {
     >/dev/null aws ec2 modify-network-interface-attribute --network-interface-id ${networkInterfaceId} --no-source-dest-check || return 1
 }
 
+listSsmAssociationForInstance() {
+    [[ $# -eq 1 ]] || { >&2 echo "Usage: $0 $FUNCNAME INSTANCE_ID"; return 1; }
+    local instanceId=$1
+    aws ssm list-associations --association-filter-list key=InstanceId,value=${instanceId}
+}
+
+consoleOutput() {
+    [[ $# -eq 1 ]] || { >&2 echo "Usage: $0 $FUNCNAME INSTANCE_ID"; return 1; }
+    local instanceId=$1
+    aws ec2 get-console-output --instance-id ${instanceId} | jq -r .Output
+}
+
+launchWindowsServer2016() {
+    [[ $# -ge 3 ]] || { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID NAME SUBNET_NAME [IAM_INSTANCE_PROFILE]"; return 1; }
+    local systemId=${1}
+    local name=${2}
+    local subnetName=${3}
+    local iamInstanceProfile=${4}
+    securityGroupId=$(createSecurityGroup ${systemId} "${name}.${subnetName}" \
+        "IpProtocol=TCP,FromPort=3389,ToPort=3389,IpRanges=[{CidrIp=0.0.0.0/0}]") || return 1
+    launchInstance ${systemId} ${name} "ami-f97e8f80" ${subnetName} "t2.micro" ${securityGroupId} ${iamInstanceProfile}
+}
+
 launchInstance() {
-    [[ $# -ne 6 ]] && { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID NAME IMAGE_NAME SUBNET_NAME INSTANCE_TYPE SECURITY_GROUP_ID"; return 1; }
-    local output name imageId subnetId subnetName systemId securityGroupId
-    systemId=${1}
-    name=${2}
-    imageName=${3}
-    subnetName=${4}
-    instanceType=${5}
-    securityGroupId=${6}
+    [[ $# -ge 6 ]] || { >&2 echo "Usage: $0 $FUNCNAME SYSTEM_ID NAME IMAGE_NAME SUBNET_NAME INSTANCE_TYPE SECURITY_GROUP_ID [IAM_INSTANCE_PROFILE [USER_DATA]]"; return 1; }
+    local systemId=${1}
+    local name=${2}
+    local imageName=${3}
+    local subnetName=${4}
+    local instanceType=${5}
+    local securityGroupId=${6}
+    local iamInstanceProfile=${7}
+    local userData=${8}
+    local imageId subnetId keyName output id
     imageId=$(imageId ${imageName}) || { >&2 echo "Image ${imageName} not found"; return 1; }
     subnetId=$(subnetId ${systemId} ${subnetName})
     keyName=$(createKeyPair ${systemId} ${name}) || { >&2 echo "Failed to create key pair"; return 1; }
@@ -164,7 +209,9 @@ launchInstance() {
 	    --security-group-ids ${securityGroupId} \
 	    --instance-type ${instanceType} \
 	    --subnet-id ${subnetId} \
+	    --iam-instance-profile Name=${iamInstanceProfile} \
 	    --key-name ${keyName} \
+	    --associate-public-ip-address \
 	    ) || return 1
 	id=$(echo ${output} | jq -er ".Instances[].InstanceId") || { >&2 echo "Error extracting id from response ${output}"; return 1; }
     addNameTag ${id} ${name} || { >&2 echo "Failed to add name tag"; return 1; }
@@ -463,7 +510,8 @@ keyFile() {
     local systemId name
     systemId=$1
     name=$2
-    echo "$(pwd)/.environment/${systemId}/key_${name}"
+    mkdir -p "$HOME/.aws/systems/${systemId}"
+    echo "$HOME/.aws/systems/${systemId}/key_${name}"
 }
 
 login() {
